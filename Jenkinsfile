@@ -83,18 +83,26 @@ pipeline {
 
         stage('Trivy Scan') {
             steps {
-                // Report HIGH/CRITICAL vulnerabilities. exit-code 0 keeps the
-                // pipeline green so the image still publishes; set to 1 to gate.
+                // Report HIGH/CRITICAL vulnerabilities. Persistent cache volume so
+                // the vuln DB downloads once; alt DB repo + retry for flaky pulls.
+                // exit-code 0 keeps the pipeline green; set to 1 to gate.
                 sh """
-                    docker run --rm \
-                        -v /var/run/docker.sock:/var/run/docker.sock \
-                        -v \$PWD:/out \
-                        aquasec/trivy:latest image \
-                        --severity HIGH,CRITICAL \
-                        --exit-code 0 \
-                        --format table \
-                        --output /out/trivy-report.txt \
-                        ${IMAGE_REF}:${IMAGE_TAG}
+                    for i in 1 2 3; do
+                        docker run --rm \
+                            -v /var/run/docker.sock:/var/run/docker.sock \
+                            -v trivy-cache:/root/.cache/ \
+                            -v \$PWD:/out \
+                            aquasec/trivy:latest image \
+                            --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
+                            --timeout 15m \
+                            --severity HIGH,CRITICAL \
+                            --exit-code 0 \
+                            --format table \
+                            --output /out/trivy-report.txt \
+                            ${IMAGE_REF}:${IMAGE_TAG} && break
+                        echo "Trivy attempt \$i failed, retrying in 5s..."
+                        sleep 5
+                    done
                 """
             }
             post {

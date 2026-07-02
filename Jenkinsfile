@@ -9,13 +9,15 @@ pipeline {
         IMAGE_NAME      = 'tasklist-frontend'
         IMAGE_TAG       = "${BUILD_NUMBER}"
         DOCKERHUB_CREDS = credentials('dockerhub-credentials')
+        // Docker Hub namespace comes from the credential username — no name hardcoded.
+        IMAGE_REF       = "${DOCKERHUB_CREDS_USR}/tasklist-frontend"
     }
 
     stages {
 
         stage('Install') {
             steps {
-                sh 'npm install'
+                sh 'npm ci'
             }
         }
 
@@ -52,12 +54,61 @@ pipeline {
             }
         }
 
-        stage('Docker Build & Push') {
+        stage('Docker Build') {
             steps {
-                sh "docker build -t ${DOCKERHUB_CREDS_USR}/${IMAGE_NAME}:${IMAGE_TAG} -t ${DOCKERHUB_CREDS_USR}/${IMAGE_NAME}:latest ."
-                sh "echo ${DOCKERHUB_CREDS_PSW} | docker login -u ${DOCKERHUB_CREDS_USR} --password-stdin"
-                sh "docker push ${DOCKERHUB_CREDS_USR}/${IMAGE_NAME}:${IMAGE_TAG}"
-                sh "docker push ${DOCKERHUB_CREDS_USR}/${IMAGE_NAME}:latest"
+                sh "docker build -t ${IMAGE_REF}:${IMAGE_TAG} -t ${IMAGE_REF}:latest ."
+            }
+        }
+
+        stage('SBOM (SPDX)') {
+            steps {
+                // Generate an SPDX-format SBOM of the built image with Trivy,
+                // run from its official image (no local install needed).
+                sh """
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v \$PWD:/out \
+                        aquasec/trivy:latest image \
+                        --format spdx-json \
+                        --output /out/sbom-spdx.json \
+                        ${IMAGE_REF}:${IMAGE_TAG}
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'sbom-spdx.json', fingerprint: true, allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                // Report HIGH/CRITICAL vulnerabilities. exit-code 0 keeps the
+                // pipeline green so the image still publishes; set to 1 to gate.
+                sh """
+                    docker run --rm \
+                        -v /var/run/docker.sock:/var/run/docker.sock \
+                        -v \$PWD:/out \
+                        aquasec/trivy:latest image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        --output /out/trivy-report.txt \
+                        ${IMAGE_REF}:${IMAGE_TAG}
+                """
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt', fingerprint: true, allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                sh 'echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin'
+                sh "docker push ${IMAGE_REF}:${IMAGE_TAG}"
+                sh "docker push ${IMAGE_REF}:latest"
             }
             post {
                 always {
@@ -69,10 +120,12 @@ pipeline {
 
     post {
         always {
-            cleanWs()
+            node('') {
+                cleanWs()
+            }
         }
         success {
-            echo "Pipeline success — image: ${DOCKERHUB_CREDS_USR}/${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "Pipeline success — image pushed: ${IMAGE_REF}:${IMAGE_TAG}"
         }
         failure {
             echo "Pipeline failed — check logs"
